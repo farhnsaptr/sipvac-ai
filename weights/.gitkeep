@@ -1,0 +1,7 @@
+# Put model files here:
+# - model_final.pth   (Mask-RCNN cropper, from ai-result/preprocessing/model/)
+# - best_model.pth    (CRNN KTP OCR, from ai-result/training/model/)
+# - vocab.json        (CRNN vocab, from training run output)
+#
+# These are NOT committed to git (see .gitignore).
+# Upload them to HuggingFace Space via the web UI or git-lfs.

@@ -1,0 +1,28 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9       # required for File() uploads in FastAPI
+
+# ── Image processing ──────────────────────────────────────────────────────────
+opencv-python-headless==4.9.0.80
+Pillow==10.3.0
+numpy==1.26.4
+
+# ── OCR engines ───────────────────────────────────────────────────────────────
+easyocr==1.7.1
+pytesseract==0.3.10           # needs system Tesseract: apt-get install tesseract-ocr
+
+# ── Deep learning ─────────────────────────────────────────────────────────────
+torch==2.3.0
+torchvision==0.18.0
+
+# ── Detectron2 ────────────────────────────────────────────────────────────────
+# HuggingFace Spaces note:
+#   detectron2 does NOT have a PyPI wheel — install from GitHub in your
+#   Space's Dockerfile or requirements by uncommenting the line below.
+#   Match the torch/CUDA version exactly:
+#
+# detectron2 @ git+https://github.com/facebookresearch/detectron2.git
+#
+# For CPU-only Spaces (free tier), use this pre-built wheel:
+# detectron2 @ https://dl.fbaipublicfiles.com/detectron2/wheels/cpu/torch2.3/detectron2-0.6-cp310-cp310-linux_x86_64.whl

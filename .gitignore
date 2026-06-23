@@ -1,0 +1,21 @@
+# Large model weight files — do NOT commit these to git
+# Upload them via HuggingFace web UI or git-lfs
+weights/*.pth
+weights/*.pt
+weights/*.bin
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
