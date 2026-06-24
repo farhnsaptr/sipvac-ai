@@ -1,274 +1,301 @@
 """
 ktp_reader.py
 =============
-CRNN + Joint CTC-Attention model for reading individual KTP fields.
+EasyOCR-based KTP field extractor.
 
-Architecture is identical to the training code in:
-  ai-result/training/cp_training_crnn.py
+Strategy:
+  1. Preprocess image (upscale 2x, denoise, sharpen)
+  2. Run EasyOCR to detect all text blocks with bounding boxes
+  3. Group blocks into rows by y-coordinate proximity
+  4. Find KTP field labels by keyword matching (with OCR-typo variants)
+  5. Extract the value to the right of the label on the same row
+     OR from the next row if the label is standalone
+  6. Apply field-specific cleanup & normalization
+  7. Return dict of field_name -> value
 
-Workflow:
-  1. Receive the 800x500 cropped KTP image.
-  2. Extract each field region using fixed bounding boxes (ktp_layout.py).
-  3. Run each crop through the CRNN to decode the text.
-  4. Return a dict of field_name → decoded_text.
+This approach works WITHOUT CRNN weights and WITHOUT perspective correction.
 """
 
-import os
-import json
+import re
 import logging
 import numpy as np
 import cv2
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_torch_available = False
+_easyocr_available = False
 try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from PIL import Image, ImageOps
-    import torchvision.transforms as T
-    _torch_available = True
+    import easyocr as _easyocr
+    _easyocr_available = True
 except ImportError:
-    logger.warning("PyTorch not installed. KTPReader will return empty strings.")
+    logger.warning("easyocr not installed. KTPReader will return empty strings.")
 
-from utils.image_utils import resize_pad_grayscale
-from utils.ktp_layout import KTP_FIELD_REGIONS
+# ── Label keywords per field (OCR typo variants included) ─────────────────────
+FIELD_KEYWORDS: Dict[str, List[str]] = {
+    "nik":             ["NIK", "NIX", "NI K"],
+    "nama":            ["NAMA"],
+    "tempat_lahir":    ["TEMPAT", "TMP LAHIR", "TEMPATLAHIR"],
+    "jenis_kelamin":   ["JENIS KELAMIN", "JENISKELAMIN", "JENIS", "KELAMIN"],
+    "gol_darah":       ["GOL. DARAH", "GOL DARAH", "GOL.DARAH", "GOLDARAH"],
+    "alamat":          ["ALAMAT"],
+    "rt_rw":           ["RT/RW", "RT RW"],
+    "kel_desa":        ["KEL/DESA", "KELURAHAN/DESA", "KEL.", "DESA"],
+    "kecamatan":       ["KECAMATAN"],
+    "agama":           ["AGAMA"],
+    "status_kawin":    ["STATUS PERKAWINAN", "STATUS", "PERKAWINAN"],
+    "pekerjaan":       ["PEKERJAAN"],
+    "kewarganegaraan": ["KEWARGANEGARAAN"],
+}
 
-WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "..", "weights", "best_model.pth")
-VOCAB_PATH   = os.path.join(os.path.dirname(__file__), "..", "weights", "vocab.json")
+# Ordered by priority so tanggal_lahir is parsed from tempat_lahir row
+FIELD_ORDER = [
+    "nik", "nama", "tempat_lahir", "jenis_kelamin", "gol_darah",
+    "alamat", "rt_rw", "kel_desa", "kecamatan",
+    "agama", "status_kawin", "pekerjaan", "kewarganegaraan",
+]
 
-IMG_H, IMG_W = 32, 512
-
-
-# ─── Model Architecture (mirrors training code exactly) ───────────────────────
-
-class VGGFeatureExtractor(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 64, 3, 1, 1), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, 3, 1, 1), nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(128, 256, 3, 1, 1), nn.BatchNorm2d(256), nn.ReLU(True),
-            nn.Conv2d(256, 256, 3, 1, 1), nn.ReLU(True),
-            nn.MaxPool2d((2, 1), (2, 1)),
-            nn.Conv2d(256, 512, 3, 1, 1), nn.BatchNorm2d(512), nn.ReLU(True),
-            nn.Conv2d(512, 512, 3, 1, 1), nn.ReLU(True),
-            nn.MaxPool2d((2, 1), (2, 1)),
-            nn.Conv2d(512, 512, 2, 1, 0), nn.BatchNorm2d(512), nn.ReLU(True),
-        )
-
-    def forward(self, x):
-        out = self.cnn(x).squeeze(2)   # [B, 512, W']
-        return out.permute(2, 0, 1)    # [W', B, 512]
+DATE_RE   = re.compile(r'\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b')
+NIK_RE    = re.compile(r'\b(\d{16})\b')
+NIK_LOOSE = re.compile(r'(\d{14,18})')   # fallback if spaced
 
 
-class BLSTMEncoder(nn.Module):
-    def __init__(self, input_size=512, hidden_size=256, num_layers=2):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=False, bidirectional=True,
-                            dropout=0.1 if num_layers > 1 else 0.0)
-        self.proj = nn.Linear(hidden_size * 2, hidden_size * 2)
+# ── Image preprocessing ───────────────────────────────────────────────────────
 
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        return self.proj(out)
+def _preprocess(img_bgr: np.ndarray) -> np.ndarray:
+    gray      = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    upscaled  = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    denoised  = cv2.fastNlMeansDenoising(upscaled, h=10, templateWindowSize=7, searchWindowSize=21)
+    kernel    = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(denoised, -1, kernel)
+    return sharpened
 
 
-class CTCHead(nn.Module):
-    def __init__(self, input_size=512, num_classes=100):
-        super().__init__()
-        self.fc = nn.Linear(input_size, num_classes)
+# ── Block grouping helpers ────────────────────────────────────────────────────
 
-    def forward(self, enc_out):
-        return F.log_softmax(self.fc(enc_out), dim=2)
+Block = Tuple[float, float, float, float, str, float]   # x1,y1,x2,y2,text,conf
 
 
-class AttentionDecoder(nn.Module):
-    def __init__(self, enc_hidden=512, dec_hidden=256, num_classes=100,
-                 max_len=64, sos_idx=1, eos_idx=2):
-        super().__init__()
-        self.num_classes = num_classes
-        self.max_len = max_len
-        self.sos_idx = sos_idx
-        self.eos_idx = eos_idx
-        self.embed = nn.Embedding(num_classes, dec_hidden)
-        self.lstm  = nn.LSTMCell(dec_hidden + enc_hidden, dec_hidden)
-        self.attn_W_enc = nn.Linear(enc_hidden, dec_hidden, bias=False)
-        self.attn_W_dec = nn.Linear(dec_hidden, dec_hidden, bias=False)
-        self.attn_v     = nn.Linear(dec_hidden, 1, bias=False)
-        self.fc = nn.Linear(dec_hidden + enc_hidden, num_classes)
-
-    def attention(self, enc_out, dec_h):
-        energy = torch.tanh(
-            self.attn_W_enc(enc_out) + self.attn_W_dec(dec_h).unsqueeze(0)
-        )
-        score   = self.attn_v(energy).squeeze(2)
-        weight  = F.softmax(score, dim=0)
-        context = (weight.unsqueeze(2) * enc_out).sum(0)
-        return context, weight
-
-    def forward(self, enc_out, label_ids=None, teacher_forcing=False):
-        T, B, enc_h = enc_out.shape
-        max_len = label_ids.shape[1] - 1 if label_ids is not None else self.max_len
-        h = torch.zeros(B, self.lstm.hidden_size, device=enc_out.device)
-        c = torch.zeros(B, self.lstm.hidden_size, device=enc_out.device)
-        inp = torch.full((B,), self.sos_idx, dtype=torch.long, device=enc_out.device)
-        outputs = []
-        for t in range(max_len):
-            emb     = self.embed(inp)
-            ctx, _  = self.attention(enc_out, h)
-            h, c    = self.lstm(torch.cat([emb, ctx], dim=1), (h, c))
-            logit   = self.fc(torch.cat([h, ctx], dim=1))
-            outputs.append(logit)
-            inp = logit.argmax(dim=1)
-        return torch.stack(outputs, dim=1)
+def _center_y(b: Block) -> float:
+    return (b[1] + b[3]) / 2
 
 
-class CRNNJointCTCAttention(nn.Module):
-    def __init__(self, num_classes, rnn_hidden=256, rnn_layers=2,
-                 max_label_len=64, sos_idx=1, eos_idx=2, lambda_ctc=0.5):
-        super().__init__()
-        self.cnn     = VGGFeatureExtractor()
-        self.encoder = BLSTMEncoder(512, rnn_hidden, rnn_layers)
-        enc_out_size = rnn_hidden * 2
-        self.ctc_head = CTCHead(enc_out_size, num_classes)
-        self.attn_dec = AttentionDecoder(enc_out_size, rnn_hidden, num_classes,
-                                         max_label_len, sos_idx, eos_idx)
+def _group_rows(blocks: List[Block], tol: int = 18) -> List[List[Block]]:
+    if not blocks:
+        return []
+    sorted_b = sorted(blocks, key=lambda b: (_center_y(b), b[0]))
+    rows: List[List[Block]] = []
+    cur_row = [sorted_b[0]]
+    cur_cy  = _center_y(sorted_b[0])
+    for b in sorted_b[1:]:
+        cy = _center_y(b)
+        if abs(cy - cur_cy) <= tol:
+            cur_row.append(b)
+        else:
+            rows.append(sorted(cur_row, key=lambda b: b[0]))
+            cur_row = [b]
+            cur_cy  = cy
+    rows.append(sorted(cur_row, key=lambda b: b[0]))
+    return rows
 
-    def forward(self, images, label_ids=None, teacher_forcing=False):
-        feat    = self.cnn(images)
-        enc_out = self.encoder(feat)
-        ctc_log = self.ctc_head(enc_out)
-        attn_out = self.attn_dec(enc_out, label_ids, teacher_forcing)
-        return ctc_log, attn_out
+
+def _is_label(text: str, keywords: List[str]) -> bool:
+    tu = text.upper().strip()
+    return any(kw in tu for kw in keywords)
 
 
-# ─── Reader Class ─────────────────────────────────────────────────────────────
+def _value_after(row: List[Block], label_x2: float) -> str:
+    parts = [b[4] for b in row if b[0] > label_x2 - 10]
+    return " ".join(parts).strip()
+
+
+def _clean(text: str) -> str:
+    return re.sub(r'^[\s:./\-]+', '', text).strip()
+
+
+def _normalize_jenis_kelamin(text: str) -> str:
+    t = text.upper().strip()
+    if "PEREMPUAN" in t:
+        return "PEREMPUAN"
+    if "LAKI" in t or t in ("L", "L."):
+        return "LAKI-LAKI"
+    if t in ("P", "P."):
+        return "PEREMPUAN"
+    return text
+
+
+# ── Main Reader ───────────────────────────────────────────────────────────────
 
 class KTPReader:
     """
-    Loads the CRNN model once at startup and provides a `read(cropped_ktp_bgr)`
-    method that returns a dict of all decoded KTP fields.
+    EasyOCR-based KTP reader.
+    No CRNN weights or perspective correction required.
     """
 
     def __init__(self):
-        self._model  = None
-        self._vocab  = None
-        self._device = None
+        self._reader: Optional[_easyocr.Reader] = None
         self._load()
 
     def _load(self):
-        if not _torch_available:
+        if not _easyocr_available:
             return
-
-        if not os.path.isfile(WEIGHTS_PATH):
-            logger.warning(
-                f"KTPReader: weights not found at {WEIGHTS_PATH}. "
-                "Fields will be returned as empty strings. "
-                "Upload best_model.pth and vocab.json to weights/."
-            )
-            return
-
-        if not os.path.isfile(VOCAB_PATH):
-            logger.warning(f"KTPReader: vocab.json not found at {VOCAB_PATH}.")
-            return
-
         try:
-            with open(VOCAB_PATH, "r", encoding="utf-8") as f:
-                self._vocab = json.load(f)
-
-            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-            ckpt = torch.load(WEIGHTS_PATH, map_location=self._device)
-            cfg  = ckpt.get("config", {})
-
-            self._model = CRNNJointCTCAttention(
-                num_classes   = self._vocab["num_classes"],
-                rnn_hidden    = cfg.get("rnn_hidden", 256),
-                rnn_layers    = cfg.get("rnn_layers", 2),
-                max_label_len = cfg.get("max_label_len", 64),
-                sos_idx       = self._vocab["SOS_IDX"],
-                eos_idx       = self._vocab["EOS_IDX"],
-                lambda_ctc    = cfg.get("lambda_ctc", 0.5),
-            ).to(self._device)
-
-            self._model.load_state_dict(ckpt["model_state"])
-            self._model.eval()
-            logger.info(f"KTPReader: CRNN loaded on {self._device}.")
-
+            self._reader = _easyocr.Reader(['id', 'en'], gpu=False, verbose=False)
+            logger.info("KTPReader: EasyOCR initialized (id+en).")
         except Exception as e:
-            logger.error(f"KTPReader: failed to load model — {e}")
-            self._model = None
+            logger.error(f"KTPReader: EasyOCR init failed — {e}")
 
-    @torch.no_grad()
-    def _decode_crop(self, crop_bgr: np.ndarray) -> str:
-        """Run CRNN on a single field crop and return the decoded string."""
-        if self._model is None or self._vocab is None:
-            return ""
+    def _get_blocks(self, img: np.ndarray) -> List[Block]:
+        raw = self._reader.readtext(img, detail=1, paragraph=False)
+        blocks: List[Block] = []
+        for (bbox, text, conf) in raw:
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            x1, y1 = min(xs), min(ys)
+            x2, y2 = max(xs), max(ys)
+            t = text.strip()
+            if t:
+                blocks.append((x1, y1, x2, y2, t, conf))
+        return blocks
 
-        # Preprocess: grayscale → resize/pad → tensor [-1, 1]
-        padded = resize_pad_grayscale(crop_bgr, IMG_H, IMG_W)
-        pil    = Image.fromarray(padded)
-        t      = T.ToTensor()(pil)
-        t      = (t - 0.5) / 0.5
-        t      = t.unsqueeze(0).to(self._device)   # [1, 1, H, W]
+    def _try_find_nik(self, blocks: List[Block]) -> str:
+        """Search directly for a 16-digit NIK anywhere in OCR output."""
+        # Concat all text and search
+        all_text = " ".join(b[4] for b in blocks)
+        all_digits = re.sub(r'\s+', '', all_text)
+        m = NIK_RE.search(all_digits)
+        if m:
+            return m.group(1)
+        # Try removing spaces within each block
+        for b in blocks:
+            compact = re.sub(r'\s+', '', b[4])
+            m = NIK_LOOSE.search(compact)
+            if m:
+                return m.group(1)
+        return ""
 
-        _, attn_out = self._model(t, None, teacher_forcing=False)
-
-        idx2char = self._vocab["idx2char"]
-        eos_idx  = self._vocab["EOS_IDX"]
-        special  = {"<BLANK>", "<SOS>", "<EOS>", "<UNK>"}
-
-        pred_ids = attn_out.argmax(dim=2)[0].tolist()
-        result   = ""
-        for idx in pred_ids:
-            if idx == eos_idx:
-                break
-            c = idx2char.get(str(idx), "")
-            if c not in special:
-                result += c
-        return result.strip()
-
-    def read(self, cropped_ktp_bgr: np.ndarray) -> Dict[str, str]:
+    def read(self, img_bgr: np.ndarray) -> Dict[str, str]:
         """
-        Extract all field regions from the 800x500 KTP image and decode each.
+        Extract all KTP fields from the image.
 
         Returns
         -------
-        dict
-            {field_name: decoded_text, ...}
+        dict  {field_name: value_string}
         """
-        results: Dict[str, str] = {}
-        H, W = cropped_ktp_bgr.shape[:2]
+        empty = {f: "" for f in list(FIELD_KEYWORDS.keys()) + ["tanggal_lahir"]}
 
-        for field, (x1, y1, x2, y2) in KTP_FIELD_REGIONS.items():
-            # Clamp to image bounds
-            x1c = max(0, x1); y1c = max(0, y1)
-            x2c = min(W, x2); y2c = min(H, y2)
+        if self._reader is None:
+            return empty
 
-            if x2c <= x1c or y2c <= y1c:
-                results[field] = ""
-                continue
+        try:
+            preprocessed = _preprocess(img_bgr)
+            blocks = self._get_blocks(preprocessed)
+        except Exception as e:
+            logger.error(f"KTPReader: OCR failed — {e}")
+            return empty
 
-            crop = cropped_ktp_bgr[y1c:y2c, x1c:x2c]
+        rows = _group_rows(blocks)
+        results: Dict[str, str] = {f: "" for f in list(FIELD_KEYWORDS.keys()) + ["tanggal_lahir"]}
 
-            if crop.size == 0:
-                results[field] = ""
-                continue
+        # ── 1. Direct NIK detection ───────────────────────────────────────────
+        results["nik"] = self._try_find_nik(blocks)
 
-            try:
-                results[field] = self._decode_crop(crop)
-            except Exception as e:
-                logger.warning(f"KTPReader: error decoding field '{field}' — {e}")
-                results[field] = ""
+        # ── 2. Label-based extraction ─────────────────────────────────────────
+        found_fields = set()
+        if results["nik"]:
+            found_fields.add("nik")
 
+        for i, row in enumerate(rows):
+            row_text = " ".join(b[4] for b in row).upper()
+
+            for field in FIELD_ORDER:
+                if field in found_fields:
+                    continue
+                keywords = FIELD_KEYWORDS.get(field, [])
+                if not keywords:
+                    continue
+
+                for j, block in enumerate(row):
+                    if not _is_label(block[4], keywords):
+                        continue
+
+                    label_x2 = block[2]
+
+                    # Value = everything to the right of this label in the same row
+                    value = _clean(_value_after(row, label_x2))
+
+                    # If nothing to the right, check the next row
+                    if not value and i + 1 < len(rows):
+                        next_row = rows[i + 1]
+                        next_text = " ".join(b[4] for b in next_row).upper()
+                        # Only take next row if it doesn't look like another label
+                        is_next_a_label = any(
+                            _is_label(b[4], kws)
+                            for f2, kws in FIELD_KEYWORDS.items()
+                            for b in next_row
+                        )
+                        if not is_next_a_label:
+                            value = _clean(" ".join(b[4] for b in next_row))
+
+                    if value:
+                        results[field] = value
+                        found_fields.add(field)
+                    break  # matched this field, move to next field
+
+        # ── 3. Parse tanggal_lahir from tempat_lahir row ──────────────────────
+        # Indonesian KTP: "Tempat/Tgl Lahir : KOTA, DD-MM-YYYY"
+        tl_val = results.get("tempat_lahir", "")
+        if tl_val:
+            m = DATE_RE.search(tl_val)
+            if m:
+                results["tanggal_lahir"] = m.group(1)
+                # Remove the date from tempat_lahir
+                results["tempat_lahir"] = _clean(tl_val[:m.start()].rstrip(", "))
+        else:
+            # Fallback: search date pattern across all OCR text if not found yet
+            all_text = " ".join(b[4] for b in blocks)
+            m = DATE_RE.search(all_text)
+            if m:
+                results["tanggal_lahir"] = m.group(1)
+
+        # ── 4. Normalize jenis_kelamin ────────────────────────────────────────
+        if results.get("jenis_kelamin"):
+            results["jenis_kelamin"] = _normalize_jenis_kelamin(results["jenis_kelamin"])
+
+        # ── 5. Fallback: collect leftover text for missing multi-line fields ──
+        # alamat can span multiple rows — collect rows between alamat and rt_rw labels
+        if not results.get("alamat"):
+            alamat_parts = []
+            collecting   = False
+            for row in rows:
+                row_text_up = " ".join(b[4] for b in row).upper()
+                if _is_label(" ".join(b[4] for b in row), FIELD_KEYWORDS["alamat"]):
+                    collecting = True
+                    # check if value is inline
+                    for b in row:
+                        if _is_label(b[4], FIELD_KEYWORDS["alamat"]):
+                            inline = _clean(_value_after(row, b[2]))
+                            if inline:
+                                alamat_parts.append(inline)
+                    continue
+                if collecting:
+                    if any(_is_label(b[4], FIELD_KEYWORDS["rt_rw"]) for b in row):
+                        break
+                    # Stop if we hit another known label
+                    if any(
+                        _is_label(b[4], kws)
+                        for f, kws in FIELD_KEYWORDS.items()
+                        if f not in ("alamat",)
+                        for b in row
+                    ):
+                        break
+                    alamat_parts.append(" ".join(b[4] for b in row))
+            if alamat_parts:
+                results["alamat"] = " ".join(alamat_parts).strip()
+
+        logger.info(f"KTPReader result: {results}")
         return results
 
 
-# Singleton loaded once at startup
+# Singleton — loaded once at service startup
 ktp_reader = KTPReader()

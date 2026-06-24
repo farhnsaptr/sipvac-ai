@@ -6,13 +6,22 @@ import logging
 from fastapi import APIRouter, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 
-from models.cropper       import cropper
-from models.ktp_reader    import ktp_reader
-from utils.image_utils    import bytes_to_cv2
-from utils.ktp_layout     import PASIEN_FIELD_MAP
+from models.cropper    import cropper
+from models.ktp_reader import ktp_reader
+from utils.image_utils import bytes_to_cv2
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Fields from ktp_reader that map directly to the pasien DB table
+PASIEN_FIELD_MAP = {
+    "nik":           "nik",
+    "nama":          "nama",
+    "tanggal_lahir": "tanggal_lahir",
+    "jenis_kelamin": "jenis_kelamin",
+    "alamat":        "alamat",
+    "pekerjaan":     "pekerjaan",
+}
 
 
 @router.post(
@@ -38,10 +47,10 @@ async def infer_ktp(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
     try:
-        # Step 1: Detect and crop document to 800×500
+        # Step 1: Detect and crop document to 800x500 (fallback = simple resize)
         cropped = cropper.crop(img_bgr)
 
-        # Step 2: Read all KTP fields with CRNN
+        # Step 2: Extract all KTP fields via EasyOCR label parsing
         raw_fields = ktp_reader.read(cropped)
 
     except Exception as e:
@@ -49,8 +58,7 @@ async def infer_ktp(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Inference error: {e}")
 
     # ── Build response ────────────────────────────────────────────────────────
-    # `fields` contains ALL detected fields (for display/debug)
-    # `pasien_data` contains only the fields that map to the pasien DB table
+    # pasien_data: only fields that map to the pasien DB table
     pasien_data = {
         db_col: raw_fields.get(ktp_field, "")
         for ktp_field, db_col in PASIEN_FIELD_MAP.items()
